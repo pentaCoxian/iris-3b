@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
 
+from iris3b.devices import default_device, inference_autocast
 from iris3b.downstream import load_export
 from iris3b.models.dit import IrisDiT
 
@@ -102,9 +103,9 @@ def fit_budget(image: Image.Image, short_side: int = 512, long_side: int = 1024)
 
 
 class Restorer:
-    def __init__(self, source: str, device: str | torch.device = "cuda"):
+    def __init__(self, source: str, device: str | torch.device | None = None):
         cfg, settings, weights, prompt = load_export(source, "restoration")
-        self.device = torch.device(device)
+        self.device = torch.device(device) if device is not None else default_device()
         with torch.device("meta"):
             model = IrisDiT(cfg.model)
         model.load_state_dict(weights, strict=True, assign=True)
@@ -128,7 +129,7 @@ class Restorer:
     def restore_tile(self, x: torch.Tensor) -> torch.Tensor:
         """[B, 3, tile, tile] in [-1, 1] -> restored, same range and size."""
         t = torch.full((x.shape[0],), self.time, device=x.device)
-        with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+        with inference_autocast(self.device):
             y = self.embeddings.expand(len(x), *self.embeddings.shape[1:])
             v = self.model(x, t, y, y_mask=self.mask.expand(len(x), -1)).x
         return x.float() - self.sigma * v.float()

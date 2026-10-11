@@ -19,6 +19,7 @@ from PIL import Image, ImageOps
 from torch import nn
 
 from iris3b.config import ModelConfig
+from iris3b.devices import default_device, inference_autocast
 from iris3b.downstream import load_export
 from iris3b.models.dit import IrisDiT
 
@@ -48,9 +49,9 @@ class IrisDepth(nn.Module):
 
 
 class DepthPredictor:
-    def __init__(self, source: str, device: str | torch.device = "cuda"):
+    def __init__(self, source: str, device: str | torch.device | None = None):
         cfg, _, weights, prompt = load_export(source, "depth")
-        self.device = torch.device(device)
+        self.device = torch.device(device) if device is not None else default_device()
         with torch.device("meta"):
             model = IrisDepth(cfg.model)
         model.num_train_timesteps = cfg.flow.num_train_timesteps
@@ -83,7 +84,7 @@ class DepthPredictor:
             image = image.resize(size, Image.Resampling.LANCZOS)
         rgb = torch.from_numpy(np.array(image)).permute(2, 0, 1)[None].to(self.device, torch.float32)
         rgb = rgb / 255 * 2 - 1
-        with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+        with inference_autocast(self.device):
             depth = self.model(rgb, self.embeddings, self.mask).float()
         if depth.shape[-2:] != (height, width):
             depth = F.interpolate(depth, size=(height, width), mode="bilinear", align_corners=False)

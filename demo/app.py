@@ -17,6 +17,7 @@ from viewers import HEAD_JS, cloud_html, slider_html
 
 import iris3b.text  # noqa: F401  (registers encoders)
 from iris3b.config import inference_config
+from iris3b.devices import default_device, inference_autocast
 from iris3b.downstream.depth import DepthPredictor, colorize
 from iris3b.downstream.restoration import Restorer, fit_budget
 from iris3b.models.dit import IrisDiT
@@ -39,7 +40,7 @@ MODEL_REPO = os.environ.get("IRIS_MODEL_REPO", "speridlabs/iris-3b")
 # the rarer training buckets show artifacts
 SIZES = {f"{w}×{h}": (h, w) for h, w in [(768, 1344), (832, 1280), (896, 1152), (1024, 1024),
                                           (1152, 896), (1280, 832), (1344, 768)]}
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = default_device()
 # All three models together are ~45 GB. On ZeroGPU (or with IRIS_OFFLOAD=1) they live on the CPU and
 # only the one a request needs is moved to the GPU for that call.
 HOME = torch.device("cpu") if ZERO_GPU or os.environ.get("IRIS_OFFLOAD") == "1" else DEVICE
@@ -72,8 +73,7 @@ def infer(prompt, negative, size, steps, cfg_scale, seed, randomize):
     if randomize:
         seed = random.randint(0, 2**31 - 1)
     height, width = SIZES[size]
-    with on_gpu(model, text_encoder), torch.autocast(DEVICE.type, dtype=torch.bfloat16,
-                                                    enabled=DEVICE.type == "cuda"):
+    with on_gpu(model, text_encoder), inference_autocast(DEVICE):
         image = generate(
             model, text_encoder, [prompt], height=height, width=width, steps=int(steps), order=cfg.sample.order,
             cfg_scale=cfg_scale, cfg_interval=tuple(cfg.sample.cfg_interval), shift=cfg.flow.shift,
