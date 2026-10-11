@@ -17,6 +17,7 @@ from torch import nn
 from iris3b.config import ModelConfig
 from iris3b.models import ac
 from iris3b.models.blocks.pit import PiTBlock
+from iris3b.models.step_cache import StepCache
 from iris3b.nn.embeddings import (
     LayerwiseTextEmbedder,
     PatchEmbedder,
@@ -262,6 +263,7 @@ class IrisDiT(nn.Module):
         y: torch.Tensor,
         capture: tuple[int, ...] = (),
         y_mask: torch.Tensor | None = None,
+        cache: StepCache | None = None,
     ) -> IrisOutput:
         """Predict flow velocity.
 
@@ -271,10 +273,14 @@ class IrisDiT(nn.Module):
             y: text encoder states, [B, T, text_dim], or selected layer states
                 [B, T, L, text_dim] for ``text_adapter="lap_blocks2"``.
             capture: 1-based block indices whose output patch tokens to return.
+                Blocks skipped by ``cache`` are not captured.
             y_mask: encoder attention mask, [B, T] (1 = real token). Ignored by
                 ``text_adapter="linear"``; REQUIRED by the masked transformer
                 adapters, which raise rather than run maskless. The trunk's
                 joint attention never consumes it.
+            cache: sampling-run state that reuses the text adapter output and,
+                above its threshold, the trunk residual across solver steps
+                (see ``models/step_cache.py``). Inference only.
         """
         cfg = self.cfg
         p = cfg.patch_size
@@ -291,20 +297,10 @@ class IrisDiT(nn.Module):
         t_emb = self.t_embedder(t)  # [B, 1, D]
         cond = F.silu(t_emb)
 
-        y = y[:, : cfg.text_len]
-        if self._adapter_needs_mask:
-            if y_mask is None:
-                raise ValueError(
-                    f"model.text_adapter='{cfg.text_adapter}' masks pad text positions and therefore "
-                    f"requires y_mask (the encoder's [B, T] attention mask); it was not passed at "
-                    f"{_caller_site()}. Silently running maskless would train and sample under "
-                    "different attention than every other call site."
-                )
-            y = self.y_embedder(y, y_mask[:, : cfg.text_len])
+        if cache is None:
+            y = self._embed_text(y, y_mask)
         else:
-            y = self.y_embedder(y)  # linear adapter is mask-agnostic by design
-        if self.y_pos_embedding is not None:
-            y = y + self.y_pos_embedding[:, : y.shape[1]].to(y.dtype)
+            y = cache.text(batch, lambda: self._embed_text(y, y_mask))
 
         rope_img = self._fetch_rope_img(grid, x.device)
         rope_txt = self._fetch_rope_txt(y.shape[1], x.device)
@@ -314,10 +310,21 @@ class IrisDiT(nn.Module):
         every = self.ac_selective_every
 
         features: dict[int, torch.Tensor] = {}
-        for i, block in enumerate(self.blocks):
+        probe_depth = cache.probe_blocks if cache is not None else len(self.blocks)
+        for i, block in enumerate(self.blocks[:probe_depth]):
             s, y = ac.run(block, (s, y, cond, rope_img, rope_txt), policy, i, every)
             if i + 1 in capture:
                 features[i + 1] = s
+        if cache is not None and cache.should_skip(s):
+            s = s + cache.residual()
+        elif probe_depth < len(self.blocks):
+            probe = s
+            for i, block in enumerate(self.blocks[probe_depth:], start=probe_depth):
+                s, y = ac.run(block, (s, y, cond, rope_img, rope_txt), policy, i, every)
+                if i + 1 in capture:
+                    features[i + 1] = s
+            if cache.threshold > 0:
+                cache.store(probe, s)
 
         s = F.silu(t_emb + s)  # timestep re-fused into every patch token
 
@@ -336,6 +343,24 @@ class IrisDiT(nn.Module):
 
         x_out = F.fold(folded, output_size=(height, width), kernel_size=p, stride=p)
         return IrisOutput(x=x_out, features=features)
+
+    def _embed_text(self, y: torch.Tensor, y_mask: torch.Tensor | None) -> torch.Tensor:
+        cfg = self.cfg
+        y = y[:, : cfg.text_len]
+        if self._adapter_needs_mask:
+            if y_mask is None:
+                raise ValueError(
+                    f"model.text_adapter='{cfg.text_adapter}' masks pad text positions and therefore "
+                    f"requires y_mask (the encoder's [B, T] attention mask); it was not passed at "
+                    f"{_caller_site()}. Silently running maskless would train and sample under "
+                    "different attention than every other call site."
+                )
+            y = self.y_embedder(y, y_mask[:, : cfg.text_len])
+        else:
+            y = self.y_embedder(y)  # linear adapter is mask-agnostic by design
+        if self.y_pos_embedding is not None:
+            y = y + self.y_pos_embedding[:, : y.shape[1]].to(y.dtype)
+        return y
 
     @property
     def num_parameters(self) -> int:
