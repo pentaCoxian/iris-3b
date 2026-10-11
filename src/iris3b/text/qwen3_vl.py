@@ -47,6 +47,8 @@ class Qwen3VLTextEncoder(TextEncoder):
                 "text_encoder.on_caption_overflow must be warn, error or silent, got "
                 f"{cfg.on_caption_overflow!r}"
             )
+        if cfg.quantize not in ("none", "int8"):
+            raise ValueError(f"text_encoder.quantize must be none or int8, got {cfg.quantize!r}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.pretrained)
         # The padded batch is assembled here instead of by the tokenizer: the
@@ -81,13 +83,20 @@ class Qwen3VLTextEncoder(TextEncoder):
         self._last_overflow_log = -_OVERFLOW_LOG_INTERVAL
 
         dtype = getattr(torch, cfg.dtype)
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            cfg.pretrained,
-            dtype=dtype,
-            attn_implementation=cfg.attn_implementation,
-        )
-        decoder = model.get_decoder()
-        del model
+        if cfg.quantize == "int8":
+            decoder = self._load_int8_decoder(cfg, dtype)
+        else:
+            # loading straight onto an accelerator skips the full CPU copy, which on
+            # unified memory would otherwise double the peak while the weights move
+            placement = {} if self.device.type == "cpu" else {"device_map": {"": self.device}}
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                cfg.pretrained,
+                dtype=dtype,
+                attn_implementation=cfg.attn_implementation,
+                **placement,
+            )
+            decoder = model.get_decoder()
+            del model
 
         hidden_size = getattr(decoder.config, "hidden_size", None)
         if hidden_size != self.dim:
@@ -110,6 +119,56 @@ class Qwen3VLTextEncoder(TextEncoder):
         self.decoder.requires_grad_(False)
         if cfg.compile:
             self.decoder.compile()
+
+    def _load_int8_decoder(self, cfg: TextEncoderConfig, dtype: torch.dtype):
+        """Build the language stack empty, then fill it tensor by tensor from the
+        checkpoint, quantizing each Linear as it arrives. Peak memory is the int8
+        decoder plus one bf16 tensor; the vision tower is never read."""
+        import json
+
+        from accelerate import init_empty_weights
+        from huggingface_hub import snapshot_download
+        from safetensors import safe_open
+        from torch import nn
+        from transformers import AutoConfig, Qwen3VLForConditionalGeneration
+
+        from iris3b.quant import Int8Linear
+
+        root = Path(cfg.pretrained)
+        if not root.is_dir():
+            root = Path(snapshot_download(cfg.pretrained, allow_patterns=["*.json", "*.safetensors"]))
+        with init_empty_weights():  # parameters on meta; buffers (rotary tables) stay real
+            model = Qwen3VLForConditionalGeneration._from_config(
+                AutoConfig.from_pretrained(root), dtype=dtype, attn_implementation=cfg.attn_implementation
+            )
+        decoder = model.get_decoder()
+        prefix = next(name for name, module in model.named_modules() if module is decoder) + "."
+        del model
+
+        for module in list(decoder.modules()):
+            for child_name, child in list(module.named_children()):
+                if isinstance(child, nn.Linear):
+                    shell = Int8Linear(child.in_features, child.out_features, child.bias is not None, self.device)
+                    setattr(module, child_name, shell)
+        weight_map = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
+        files = sorted({f for key, f in weight_map.items() if key.startswith(prefix)})
+        for file in files:
+            # staged through the CPU: reading straight onto MPS lets its caching
+            # allocator hold every freed bf16 tensor, which more than doubles the peak
+            with safe_open(str(root / file), framework="pt") as f:
+                for key in f.keys():  # noqa: SIM118  (safe_open is not a mapping)
+                    if not key.startswith(prefix):
+                        continue
+                    owner_name, leaf = key[len(prefix) :].rsplit(".", 1)
+                    owner = decoder.get_submodule(owner_name)
+                    tensor = f.get_tensor(key)
+                    if isinstance(owner, Int8Linear) and leaf == "weight":
+                        owner.load_weight(tensor.to(self.device, dtype))
+                    else:
+                        owner._parameters[leaf] = nn.Parameter(tensor.to(self.device, dtype), requires_grad=False)
+        if missing := [n for n, p in decoder.named_parameters() if p.is_meta]:
+            raise RuntimeError(f"checkpoint left decoder parameters unset: {missing[:5]}")
+        return decoder.to(self.device)
 
     def _tokenize_captions(self, prompts: list[str]) -> list[list[int]]:
         """Tokenize captions alone and account for anything past the budget."""

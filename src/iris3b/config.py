@@ -159,6 +159,9 @@ class TextEncoderConfig:
     # caption is truncated, so the chat turn can never be eaten. "warn" counts
     # and logs overflows once per interval, "error" refuses the batch.
     on_caption_overflow: str = "warn"  # warn | error | silent
+    # "int8": weight-only int8 decoder Linears, quantized while streaming from
+    # disk, so the bf16 decoder (~8 GB) is never resident; inference only
+    quantize: str = "none"  # none | int8
 
 
 @dataclass
