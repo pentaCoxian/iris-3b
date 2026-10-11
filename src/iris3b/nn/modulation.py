@@ -121,3 +121,17 @@ class ModulationBuilder:
         if self.mode == "shared_bias":
             return SharedCoreBias(self.dim, core)
         return SharedCoreModulation(self.dim, self.rank, core)
+
+
+def rebind_shared_cores(model: nn.Module, replaced: dict[int, nn.Module]) -> None:
+    """Point every block's hidden core reference at its replacement.
+
+    Shared cores live in ``model.modulation_cores`` and, unregistered, in each
+    block's ``_core`` tuple. Code that swaps a registered core module (a LoRA
+    wrapper, an int8 layer) must call this, or the blocks keep calling the old one.
+    ``replaced`` maps ``id(old_module)`` to the new module.
+    """
+    for module in model.modules():
+        core = getattr(module, "_core", None)
+        if isinstance(core, tuple) and core and id(core[0]) in replaced:
+            module._core = (replaced[id(core[0])],)
