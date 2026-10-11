@@ -116,6 +116,14 @@ pip install -e .            # Python >= 3.11, PyTorch >= 2.7.1
 pip install -e ".[dev]"     # + pytest, ruff
 ```
 
+Or with [uv](https://docs.astral.sh/uv/), which creates `.venv` and installs the package editable:
+
+```bash
+uv sync --extra dev         # add --extra ui for the demo
+uv run pytest -q
+uv run python scripts/sample.py --checkpoint iris-3b --prompt "..."
+```
+
 ## Inference
 
 ```bash
@@ -127,7 +135,87 @@ python scripts/sample.py --checkpoint iris-3b \
 `--checkpoint` is a directory holding `model.safetensors` + `config.yaml`, or a
 training `.pth` (its EMA weights and embedded config are used). Defaults:
 1024×1024, 100 DPM-Solver++ (order 2) steps, CFG 3. Use `--txt-file` for a
-prompt list, `--steps`, `--seed`, `--negative-prompt` to adjust.
+prompt list, `--steps`, `--seed`, `--negative-prompt` to adjust. The device
+defaults to CUDA, then Apple MPS, then CPU. On CUDA and MPS the weights are held
+in BF16 (`--weights-dtype fp32` keeps the FP32 release precision), which halves
+their memory at the same speed, since inference runs under BF16 autocast either way.
+
+Faster sampling, training-free (each trades some fidelity for speed; compare
+against the defaults on your prompts):
+
+- `--steps 30`: second-order DPM-Solver++ usually needs far fewer than the
+  default 100 steps; cost is linear in steps.
+- `--cfg-interval 0 0.9`: skip CFG on the noisiest steps, which then cost one
+  forward instead of two (t = 1 is noise; with shift 4 about a third of the
+  steps lie above 0.9).
+- `--cache-threshold 0.1`: reuse the trunk's output between adjacent steps
+  while the first block's input barely changes (first-block caching). A reused
+  step costs ~15% of a full one; the pixel head always runs on the current
+  image. 0 disables it; at most 3 steps in a row are reused.
+
+On an M3 Max (40-core GPU) a 1024×1024 forward takes ~6.4 s with CFG and ~3.1 s
+without, so the defaults take ~11 min per image and `--steps 30 --cfg-interval 0 0.9`
+~2.6 min; with `--cache-threshold 0.1` on top, one measured image reused the
+trunk on 18 of 30 steps and took 77 s.
+
+### Turbo LoRA (few-step distillation)
+
+`scripts/distill_turbo.py` distills the model into a 4-step LoRA with the
+guidance baked in (DMD2: the student, the teacher and the DMD critic share one
+frozen copy of the weights; only two rank-64 adapters train, from prompts
+alone). Train at ~1 MP: the released checkpoint shows 16 px block artifacts at
+512, which a 512 student would inherit.
+
+```bash
+python scripts/distill_turbo.py --checkpoint iris-3b --prompts prompts.txt \
+    --out output/turbo --device cuda:0 --text-device cuda:1 --iters 3000
+python scripts/sample.py --checkpoint iris-3b --lora output/turbo/latest/student.safetensors \
+    --prompt "a red fox sleeping in fresh snow, golden hour"
+```
+
+The adapter is merged into the weights at load, so a step costs one plain
+forward (no CFG batch): 4 steps at 1024² take ~11–13 s per image on an M3 Max
+and ~0.9 s on an RTX 5090.
+
+### Speed demo
+
+`demo/speed.py` is a Gradio page that times every mode on the same prompt and
+seed: Fast (the 4-step turbo LoRA, on its own merged bf16 copy so it runs at
+`sample.py` speed; `--live-lora` saves the 6 GB at ~10% per step), Balanced (the
+training-free 30-step settings) and Standard (the 100-step sampler). Models are
+warmed up at launch. It reports
+wall time, forward passes, time per forward, images per minute and the speed-up
+over the 100-step sampler (measured once that has run, otherwise estimated from
+measured forward times).
+
+```bash
+pip install -e ".[ui]"
+python demo/speed.py --lora output/turbo/latest/student.safetensors   # http://127.0.0.1:7861
+```
+
+### Macs with 16 GB
+
+`--preset mac16` fits a 16 GB Mac: the prompts are encoded in a short-lived
+child process (the text encoder and the image model never coexist), the image
+model is streamed onto the GPU tensor by tensor with the LoRA merged on the way,
+weight-only int8 is applied to the text encoder and the image trunk
+(`--quantize none` keeps bf16), and images are generated one at a time. Measured
+on an M3 Max with GPU allocations capped at a 16 GB Mac's ~10.7 GB working set:
+6.9 GB peak footprint and ~11 s per 1024² turbo image (base M-series GPUs are
+slower). int8 kept text embeddings at cosine 0.9999 and images visually
+unchanged (28–38 dB PSNR against bf16 on the 4-step sampler).
+
+```bash
+python scripts/sample.py --checkpoint iris-3b --preset mac16 \
+    --lora output/turbo/latest/student.safetensors --prompt "a red fox sleeping in fresh snow"
+```
+
+| | Peak memory (1024², turbo) |
+|---|---|
+| FP32 weights, text encoder resident | 30.3 GB |
+| BF16 weights (default), text encoder resident | 24.3 GB |
+| `--preset mac16 --quantize none` | 9.3 GB |
+| `--preset mac16` (int8) | 6.9 GB |
 
 Turn a training checkpoint into a release directory (EMA weights only, FP32 by
 default, config reduced to model/text-encoder/flow settings):
