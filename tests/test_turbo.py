@@ -140,3 +140,35 @@ def test_generate_turbo_shape(steps):
 
     out = generate_turbo(model, Encoder(), ["a", "b"], 32, 32, steps=steps, shift=3.0, device="cpu")
     assert out.shape == (2, 3, 32, 32) and out.abs().max() <= 1
+
+
+def test_resolve_adapter_paths_and_hub_ids(tmp_path, monkeypatch):
+    import json
+
+    import huggingface_hub
+
+    from iris3b.lora import resolve_adapter
+
+    local = tmp_path / "a.safetensors"
+    local.write_bytes(b"x")
+    assert resolve_adapter(local) == local
+
+    manifest = {"default": "r2", "adapters": {"r2": {"file": "r2/student.safetensors"},
+                                              "r1": {"file": "r1/student.safetensors"}}}
+    fetched = []
+
+    def fake_download(repo, filename):
+        fetched.append((repo, filename))
+        path = tmp_path / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest) if filename == "config.json" else "w")
+        return str(path)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    assert resolve_adapter("me/turbo").name == "student.safetensors"
+    assert fetched == [("me/turbo", "config.json"), ("me/turbo", "r2/student.safetensors")]
+    assert resolve_adapter("me/turbo:r1").parent.name == "r1"
+    with pytest.raises(KeyError):
+        resolve_adapter("me/turbo:nope")
+    with pytest.raises(FileNotFoundError):
+        resolve_adapter("missing.safetensors")

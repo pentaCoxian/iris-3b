@@ -24,7 +24,7 @@ import torch
 from iris3b.config import Config, inference_config
 from iris3b.devices import default_device, inference_autocast, release_memory
 from iris3b.distill import generate_turbo
-from iris3b.lora import merge_lora_file
+from iris3b.lora import merge_lora_file, resolve_adapter
 from iris3b.models.dit import IrisDiT
 from iris3b.models.step_cache import StepCache
 from iris3b.quant import quantize_linears
@@ -84,8 +84,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--lora",
         default=None,
-        help="adapter .safetensors to merge; a turbo adapter (scripts/distill_turbo.py) switches to "
-        "its few-step sampler with guidance baked in, so --cfg-* and --cache-* do not apply",
+        help="adapter .safetensors or Hub id owner/repo[:name] to merge; a turbo adapter "
+        "(scripts/distill_turbo.py) switches to its few-step sampler with guidance baked in, so "
+        "--cfg-* and --cache-* do not apply",
     )
     parser.add_argument("--lora-strength", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -116,6 +117,8 @@ def main(argv: list[str] | None = None) -> None:
         "freed before the image model loads, one image at a time. Pair it with a turbo --lora.",
     )
     args = parser.parse_args(argv)
+    if args.lora:
+        args.lora = str(resolve_adapter(args.lora))
 
     low_memory = args.preset == "mac16"
     if args.quantize is None:

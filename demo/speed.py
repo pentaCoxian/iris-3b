@@ -29,7 +29,7 @@ import iris3b.text  # noqa: F401  (registers encoders)
 from iris3b.config import inference_config
 from iris3b.devices import default_device, inference_autocast
 from iris3b.distill import STUDENT, generate_turbo
-from iris3b.lora import inject_lora, load_adapter, read_metadata, use_adapter
+from iris3b.lora import inject_lora, load_adapter, read_metadata, resolve_adapter, use_adapter
 from iris3b.models.step_cache import StepCache
 from iris3b.registry import TEXT_ENCODERS
 from iris3b.sampling import generate, load_model_streaming, read_config
@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--checkpoint", default=str(ROOT / "checkpoints/iris-3b"))
-parser.add_argument("--lora", default=None, help="turbo adapter from scripts/distill_turbo.py")
+parser.add_argument("--lora", default=None, help="turbo adapter file or Hub id owner/repo[:name]")
 parser.add_argument("--device", default=None)
 parser.add_argument("--port", type=int, default=7861)
 parser.add_argument("--share", action="store_true")
@@ -46,6 +46,8 @@ parser.add_argument(
     "--live-lora", action="store_true", help="one model copy, adapter switched per run (~10%% slower)"
 )
 args = parser.parse_args()
+if args.lora:
+    args.lora = str(resolve_adapter(args.lora))
 
 DEVICE = torch.device(args.device) if args.device else default_device()
 cfg = inference_config(read_config(args.checkpoint), [])

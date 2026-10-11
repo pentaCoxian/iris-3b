@@ -21,6 +21,7 @@ import iris3b.text  # noqa: F401  (registers encoders)
 from iris3b.config import inference_config
 from iris3b.devices import default_device, inference_autocast
 from iris3b.distill import generate_turbo
+from iris3b.lora import resolve_adapter
 from iris3b.registry import TEXT_ENCODERS
 from iris3b.sampling import load_model_streaming, read_config
 
@@ -28,12 +29,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--checkpoint", default=str(ROOT / "checkpoints/iris-3b"))
-parser.add_argument("--lora", action="append", required=True, help="adapter .safetensors (repeat)")
+parser.add_argument(
+    "--lora", action="append", required=True, help="adapter file or Hub id owner/repo[:name] (repeat)"
+)
 parser.add_argument("--label", action="append", default=[], help="column label per --lora, in order")
 parser.add_argument("--device", default=None)
 parser.add_argument("--port", type=int, default=7862)
 args = parser.parse_args()
-labels = args.label + [Path(p).parent.name for p in args.lora[len(args.label) :]]
+labels = args.label + [
+    str(p).rsplit(":", 1)[-1] if ":" in str(p) else Path(p).parent.name for p in args.lora[len(args.label) :]
+]
+args.lora = [str(resolve_adapter(p)) for p in args.lora]
 
 DEVICE = torch.device(args.device) if args.device else default_device()
 cfg = inference_config(read_config(args.checkpoint), [])

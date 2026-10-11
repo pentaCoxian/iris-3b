@@ -133,6 +133,29 @@ def load_adapter(model: nn.Module, name: str, path: str | Path) -> None:
         raise KeyError(f"adapter file has weights for layers the model lacks: {sorted(missing)[:5]}")
 
 
+def resolve_adapter(spec: str | Path) -> Path:
+    """Local path to an adapter file, given a path or a Hub id ``owner/repo[:name]``.
+
+    A Hub repo carries a root ``config.json`` manifest (``{"default": name,
+    "adapters": {name: {"file": ...}}}``), fetched first: it names the file and is
+    also the file the Hub counts downloads by. ``name`` defaults to the
+    manifest's ``default``.
+    """
+    path = Path(spec)
+    if path.exists():
+        return path
+    repo, _, name = str(spec).partition(":")
+    if repo.count("/") != 1 or repo.endswith(".safetensors"):
+        raise FileNotFoundError(f"adapter {spec!r} is neither a file nor a Hub id 'owner/repo[:name]'")
+    from huggingface_hub import hf_hub_download
+
+    manifest = json.loads(Path(hf_hub_download(repo, "config.json")).read_text())
+    name = name or manifest["default"]
+    if name not in manifest["adapters"]:
+        raise KeyError(f"{repo} has no adapter {name!r} (available: {sorted(manifest['adapters'])})")
+    return Path(hf_hub_download(repo, manifest["adapters"][name]["file"]))
+
+
 def read_metadata(path: str | Path) -> dict:
     from safetensors import safe_open
 

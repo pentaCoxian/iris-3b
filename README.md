@@ -173,6 +173,9 @@ python scripts/sample.py --checkpoint iris-3b --lora output/turbo/latest/student
     --prompt "a red fox sleeping in fresh snow, golden hour"
 ```
 
+`--lora` also takes a Hub id: `--lora pentacoxian-dev/iris-3b-turbo-lora` loads the published
+default adapter, `...:r1-1500` a named one (the repo's `config.json` manifest lists them).
+
 The adapter is merged into the weights at load, so a step costs one plain
 forward (no CFG batch): 4 steps at 1024² take ~11–13 s per image on an M3 Max
 and ~0.9 s on an RTX 5090.
